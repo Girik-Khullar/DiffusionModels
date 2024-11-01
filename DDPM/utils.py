@@ -4,7 +4,7 @@ import torchvision
 from PIL import Image
 from matplotlib import pyplot as plt
 from torch.utils.data import DataLoader
-from schedule import VarianceSchedule
+from .schedule import VarianceSchedule
 
 
 def apply_schedules(dataloader: torch.utils.data.DataLoader, n_images: int, num_timesteps: int, num_intermediate_steps: int, schedule_type='linear'):
@@ -12,7 +12,7 @@ def apply_schedules(dataloader: torch.utils.data.DataLoader, n_images: int, num_
     variance_schedule = VarianceSchedule(num_timesteps, schedule_type=schedule_type)
     betas = variance_schedule.get_betas()
 
-    # Generate alpha and alpha_cumprod for diffusion steps
+    # Generate alpha and alpha_cumprod fsor diffusion steps
     alphas = 1 - betas
     alpha_cumprod = torch.cumprod(alphas, dim=0)
 
