@@ -1,12 +1,14 @@
 import math
 import torch
+import matplotlib.pyplot as plt
 
 # Defines the noising schedule for the forward process
 class VarianceSchedule:
-    def __init__(self, num_timesteps, schedule_type='linear'):
+    def __init__(self, num_timesteps: int, schedule_type='linear'):
         self.num_timesteps = num_timesteps
         self.schedule_type = schedule_type
         self.betas = self._create_schedule()
+        self.alphas = self._compute_alphas()
 
     def _create_schedule(self):
         """Creates a beta (variance) schedule based on the chosen type."""
@@ -43,49 +45,38 @@ class VarianceSchedule:
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
         return torch.clamp(betas, 0, 0.999)
 
+    def _compute_alphas(self):
+        """Computes alpha values from beta values."""
+        alphas = 1 - self.betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        return alphas_cumprod
+
     def get_betas(self):
         """Returns the precomputed beta schedule."""
         return self.betas
 
+    def get_alphas_cumprod(self):
+        """Returns the cumulative product of alpha values."""
+        return self.alphas
 
-def apply_schedules(dataloader, n_images, num_timesteps, num_intermediate_steps, schedule_type='linear'):
-    # Initialize the VarianceSchedule class for the selected schedule type
-    variance_schedule = VarianceSchedule(num_timesteps, schedule_type=schedule_type)
-    betas = variance_schedule.get_betas()
 
-    # Generate alpha and alpha_cumprod for diffusion steps
-    alphas = 1 - betas
-    alpha_cumprod = torch.cumprod(alphas, dim=0)
+if __name__ == "__main__":
+    # Example usage
+    num_timesteps = 1000
+    schedule_types = ['linear', 'sigmoid', 'cosine']
 
-    # Define intermediate timesteps to display
-    step_indices = torch.linspace(0, num_timesteps - 1, num_intermediate_steps, dtype=torch.long)
+    plt.figure(figsize=(12, 8))
 
-    # Select a batch of images from the dataloader and limit to n_images
-    images, _ = next(iter(dataloader))
-    images = images[:n_images]  # Take the first n_images
+    for schedule_type in schedule_types:
+        variance_schedule = VarianceSchedule(num_timesteps, schedule_type)
+        alphas_cumprod = variance_schedule.get_alphas_cumprod()
 
-    # Set up plot for multiple images and their noisy progressions
-    fig, axes = plt.subplots(n_images, num_intermediate_steps + 1, figsize=(15, 5 * n_images))
-    fig.suptitle(f"Noise Progression with {schedule_type.capitalize()} Schedule", fontsize=16)
+        # Plotting the alpha cumulative product for each schedule type
+        plt.plot(alphas_cumprod.numpy(), label=f'Cumulative Product of Alphas ({schedule_type})')
 
-    for img_idx in range(n_images):
-        image = images[img_idx].unsqueeze(0)  # Select each image individually and add batch dimension
-
-        # Display the original image
-        axes[img_idx, 0].imshow(image[0].permute(1, 2, 0))
-        axes[img_idx, 0].set_title("Original")
-        axes[img_idx, 0].axis("off")
-
-        # Display progressively noisier versions of the image
-        for i, t in enumerate(step_indices, start=1):
-            # Apply noise at step t based on the cumulative alpha product
-            noise = torch.randn_like(image)
-            noisy_image = (alpha_cumprod[t].sqrt() * image) + ((1 - alpha_cumprod[t]).sqrt() * noise)
-
-            # Show the noisy image at this intermediate step
-            axes[img_idx, i].imshow(noisy_image[0].permute(1, 2, 0).clamp(0, 1))
-            axes[img_idx, i].set_title(f"Step {t.item()}")
-            axes[img_idx, i].axis("off")
-
-    plt.tight_layout()
+    plt.title("Cumulative Product of Alphas for Different Schedules")
+    plt.xlabel("Timesteps")
+    plt.ylabel("Alpha Cumulative Product")
+    plt.grid(True)
+    plt.legend()
     plt.show()
