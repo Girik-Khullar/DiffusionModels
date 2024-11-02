@@ -355,10 +355,10 @@ if __name__ == '__main__':
     classes = torch.randint(0, 10, (test_N,)).to(device)
     mask = torch.randn(test_N).to(device)
 
-    print(f"Input tensor shape: {x.shape}")
-    print(f"Timesteps tensor shape: {timesteps.shape}")
-    print(f"Classes tensor shape: {classes.shape}")
-    print(f"Mask tensor shape: {mask.shape}")
+    print(f"Input tensor shape: {x.shape}, {x.dtype}")
+    print(f"Timesteps tensor shape: {timesteps.shape}, {timesteps.dtype}")
+    print(f"Classes tensor shape: {classes.shape}, {classes.dtype}")
+    print(f"Mask tensor shape: {mask.shape}, {mask.dtype}")
 
     summary(model, input_data=[x, timesteps, classes, mask], depth=3)
 

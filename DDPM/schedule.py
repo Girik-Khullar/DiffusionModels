@@ -26,7 +26,7 @@ class VarianceSchedule:
         scale = 1000 / self.num_timesteps
         beta_start = scale * 0.0001
         beta_end = scale * 0.02
-        return torch.linspace(beta_start, beta_end, self.num_timesteps, dtype=torch.float64)
+        return torch.linspace(beta_start, beta_end, self.num_timesteps, dtype=torch.float32)
 
     def _sigmoid_beta_schedule(self):
         """Sigmoid schedule: betas follow a sigmoid curve."""
@@ -39,7 +39,7 @@ class VarianceSchedule:
         Cosine schedule: alphas follow a cosine curve.
         """
         steps = self.num_timesteps + 1
-        x = torch.linspace(0, self.num_timesteps, steps, dtype=torch.float64)
+        x = torch.linspace(0, self.num_timesteps, steps, dtype=torch.float32)
         alphas_cumprod = torch.cos(((x / self.num_timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])

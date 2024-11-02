@@ -37,7 +37,7 @@ class Diffusion:
 
                 # Randomly generate mask
                 z_uncound = torch.rand(n)
-                batch_mask = (z_uncound > p_uncound).int().to(self.device)
+                batch_mask = (z_uncound > p_uncound).long().to(self.device)
                 # print(x.shape, t.shape, labels.shape, batch_mask.shape)
                 predicted_noise = model(x, t, labels, batch_mask)
 
