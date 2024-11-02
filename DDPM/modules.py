@@ -1,7 +1,8 @@
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchinfo import summary
 
 
 class EMA:
@@ -32,232 +33,339 @@ class EMA:
         ema_model.load_state_dict(model.state_dict())
 
 
-class SelfAttention(nn.Module):
-    def __init__(self, channels, size):
-        super(SelfAttention, self).__init__()
-        self.channels = channels
-        self.size = size
-        self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
-        self.ln = nn.LayerNorm([channels])
-        self.ff_self = nn.Sequential(
-            nn.LayerNorm([channels]),
-            nn.Linear(channels, channels),
-            nn.GELU(),
-            nn.Linear(channels, channels),
-        )
-
-    def forward(self, x):
-        x = x.view(-1, self.channels, self.size * self.size).swapaxes(1, 2)
-        x_ln = self.ln(x)
-        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
-        attention_value = attention_value + x
-        attention_value = self.ff_self(attention_value) + attention_value
-        return attention_value.swapaxes(2, 1).view(-1, self.channels, self.size, self.size)
+# Sinusoidal position embedding for encoding time step
+def timestep_embedding(timesteps, dim, max_period=10000):
+    """
+    Create sinusoidal timestep embeddings based on input timestep indices.
+    :param timesteps: Tensor of timestep indices, shape [N].
+                      These indices may be fractional.
+    :param dim: Dimension of the output embeddings.
+    :param max_period: Controls the minimum frequency of the embeddings.
+    :return: A Tensor of shape [N x dim] containing positional embeddings.
+    """
+    half_dim = dim // 2
+    freqs = torch.exp(-math.log(max_period) * torch.arange(half_dim, dtype=torch.float32) / half_dim)
+    freqs = freqs.to(device=timesteps.device)
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2 == 1:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
 
 
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels, mid_channels=None, residual=False):
+# Abstract class for timestep block
+class TimestepBlock(nn.Module):
+    """
+    An abstract module that takes timestep embeddings as input.
+    """
+
+    def forward(self, x, emb):
+        """
+        Apply the module to `x` given `emb` timestep embeddings.
+        """
+        raise NotImplementedError
+
+
+# Sequential model that supports passing timestep embeddings
+class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
+    """
+    A sequential module that passes timestep embeddings to child layers that
+    support it as an extra input.
+    """
+
+    def forward(self, x, t_emb, c_emb, mask):
+        for layer in self:
+            if isinstance(layer, TimestepBlock):
+                x = layer(x, t_emb, c_emb, mask)
+            else:
+                x = layer(x)
+        return x
+
+
+# Normalization layer function
+def norm_layer(channels):
+    """
+    Creates a GroupNorm layer with 32 groups.
+    :param channels: Number of channels in the input.
+    :return: GroupNorm layer.
+    """
+    return nn.GroupNorm(32, channels)
+
+
+# Downsample block
+class Downsample(nn.Module):
+    """
+    A downsampling block with optional convolution or average pooling.
+    """
+
+    def __init__(self, channels, use_conv):
         super().__init__()
-        self.residual = residual
-        if not mid_channels:
-            mid_channels = out_channels
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(1, mid_channels),
-            nn.GELU(),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(1, out_channels),
-        )
-
-    def forward(self, x):
-        if self.residual:
-            return F.gelu(x + self.double_conv(x))
+        self.use_conv = use_conv
+        if use_conv:
+            self.op = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
         else:
-            return self.double_conv(x)
+            self.op = nn.AvgPool2d(kernel_size=2)
+
+    def forward(self, x):
+        return self.op(x)
 
 
-class Down(nn.Module):
-    def __init__(self, in_channels, out_channels, emb_dim=256):
+# Upsample block
+class Upsample(nn.Module):
+    """
+    An upsampling block with optional convolution.
+    """
+
+    def __init__(self, channels, use_conv):
         super().__init__()
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(in_channels, in_channels, residual=True),
-            DoubleConv(in_channels, out_channels),
-        )
+        self.use_conv = use_conv
+        if use_conv:
+            self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
 
-        self.emb_layer = nn.Sequential(
+    def forward(self, x):
+        x = F.interpolate(x, scale_factor=2, mode="nearest")
+        if self.use_conv:
+            x = self.conv(x)
+        return x
+
+
+# Attention block with shortcut connection
+class AttentionBlock(nn.Module):
+    """
+    An attention block with multiple heads and a residual connection.
+    """
+
+    def __init__(self, channels, num_heads=1):
+        super().__init__()
+        self.num_heads = num_heads
+        assert channels % num_heads == 0, "Channels must be divisible by num_heads"
+
+        self.norm = norm_layer(channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        qkv = self.qkv(self.norm(x))
+        q, k, v = qkv.reshape(B * self.num_heads, -1, H * W).chunk(3, dim=1)
+        scale = 1.0 / math.sqrt(C // self.num_heads)
+        attn = torch.einsum("bct,bcs->bts", q * scale, k * scale).softmax(dim=-1)
+        h = torch.einsum("bts,bcs->bct", attn, v).reshape(B, -1, H, W)
+        return self.proj(h) + x
+
+
+# Residual block that accepts timestep and class embeddings
+class ResidualBlock(TimestepBlock):
+    """
+    A residual block that incorporates time and class embeddings.
+    """
+
+    def __init__(self, in_channels, out_channels, time_channels, class_channels, dropout):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            norm_layer(in_channels),
             nn.SiLU(),
-            nn.Linear(
-                emb_dim,
-                out_channels
-            ),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         )
 
-    def forward(self, x, t):
-        x = self.maxpool_conv(x)
-        emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
-        return x + emb
-
-
-class Up(nn.Module):
-    def __init__(self, in_channels, out_channels, emb_dim=256):
-        super().__init__()
-
-        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-        self.conv = nn.Sequential(
-            DoubleConv(in_channels, in_channels, residual=True),
-            DoubleConv(in_channels, out_channels, in_channels // 2),
-        )
-
-        self.emb_layer = nn.Sequential(
+        # Embedding layers for time and class
+        self.time_emb = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(
-                emb_dim,
-                out_channels
-            ),
+            nn.Linear(time_channels, out_channels)
         )
 
-    def forward(self, x, skip_x, t):
-        x = self.up(x)
-        x = torch.cat([skip_x, x], dim=1)
-        x = self.conv(x)
-        emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
-        return x + emb
+        self.class_emb = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(class_channels, out_channels)
+        )
+
+        self.conv2 = nn.Sequential(
+            norm_layer(out_channels),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        )
+
+        # Define shortcut connection
+        self.shortcut = nn.Conv2d(in_channels, out_channels,
+                                  kernel_size=1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x, t, c, mask):
+        """
+        Forward pass for the residual block.
+        :param x: Input tensor with shape [batch_size, in_channels, height, width].
+        :param t: Timestep embeddings tensor with shape [batch_size, time_channels].
+        :param c: Class embeddings tensor with shape [batch_size, class_channels].
+        :param mask: Binary mask with shape [batch_size].
+        :return: Output tensor after applying residual block.
+        """
+        h = self.conv1(x)
+        emb_t = self.time_emb(t)
+        emb_c = self.class_emb(c) * mask[:, None]
+        h += (emb_t[:, :, None, None] + emb_c[:, :, None, None])
+        h = self.conv2(h)
+        return h + self.shortcut(x)
 
 
-class UNet(nn.Module):
-    def __init__(self, c_in=3, c_out=3, time_dim=256, device="cuda"):
+class UnetModel(nn.Module):
+    def __init__(self,
+                 in_channels=3,
+                 model_channels=128,
+                 out_channels=3,
+                 num_res_blocks=2,
+                 attention_resolutions=(8, 16),
+                 dropout=0,
+                 channel_mult=(1, 2, 2, 2),
+                 conv_resample=True,
+                 num_heads=4,
+                 class_num=10):
+        """
+        Initialize a U-Net model for conditional image generation with attention mechanisms.
+
+        :param in_channels: Number of input channels (e.g., 3 for RGB images).
+        :param model_channels: Base number of model channels in the network.
+        :param out_channels: Number of output channels (e.g., 3 for RGB images).
+        :param num_res_blocks: Number of residual blocks per down/up sampling level.
+        :param attention_resolutions: Resolutions at which to apply attention layers.
+        :param dropout: Dropout probability.
+        :param channel_mult: Multiplier for channels at each level of the U-Net.
+        :param conv_resample: Whether to use convolutional layers for up/downsampling.
+        :param num_heads: Number of attention heads.
+        :param class_num: Number of class labels for conditional generation.
+        """
         super().__init__()
-        self.device = device
-        self.time_dim = time_dim
-        self.inc = DoubleConv(c_in, 64)
-        self.down1 = Down(64, 128)
-        self.sa1 = SelfAttention(128, 32)
-        self.down2 = Down(128, 256)
-        self.sa2 = SelfAttention(256, 16)
-        self.down3 = Down(256, 256)
-        self.sa3 = SelfAttention(256, 8)
+        self.in_channels = in_channels
+        self.model_channels = model_channels
+        self.out_channels = out_channels
+        self.num_res_blocks = num_res_blocks
+        self.attention_resolutions = attention_resolutions
+        self.dropout = dropout
+        self.channel_mult = channel_mult
+        self.conv_resample = conv_resample
+        self.num_heads = num_heads
+        self.class_num = class_num
 
-        self.bot1 = DoubleConv(256, 512)
-        self.bot2 = DoubleConv(512, 512)
-        self.bot3 = DoubleConv(512, 256)
-
-        self.up1 = Up(512, 128)
-        self.sa4 = SelfAttention(128, 16)
-        self.up2 = Up(256, 64)
-        self.sa5 = SelfAttention(64, 32)
-        self.up3 = Up(128, 64)
-        self.sa6 = SelfAttention(64, 64)
-        self.outc = nn.Conv2d(64, c_out, kernel_size=1)
-
-    def pos_encoding(self, t, channels):
-        inv_freq = 1.0 / (
-            10000
-            ** (torch.arange(0, channels, 2, device=self.device).float() / channels)
+        # Time embedding
+        time_emb_dim = model_channels * 4
+        self.time_emb = nn.Sequential(
+            nn.Linear(model_channels, time_emb_dim),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, time_emb_dim)
         )
-        pos_enc_a = torch.sin(t.repeat(1, channels // 2) * inv_freq)
-        pos_enc_b = torch.cos(t.repeat(1, channels // 2) * inv_freq)
-        pos_enc = torch.cat([pos_enc_a, pos_enc_b], dim=-1)
-        return pos_enc
 
-    def forward(self, x, t):
-        t = t.unsqueeze(-1).type(torch.float)
-        t = self.pos_encoding(t, self.time_dim)
+        # Class embedding
+        class_emb_dim = model_channels
+        self.class_emb = nn.Embedding(class_num, class_emb_dim)
 
-        x1 = self.inc(x)
-        x2 = self.down1(x1, t)
-        x2 = self.sa1(x2)
-        x3 = self.down2(x2, t)
-        x3 = self.sa2(x3)
-        x4 = self.down3(x3, t)
-        x4 = self.sa3(x4)
+        # Downsampling blocks
+        self.down_blocks = nn.ModuleList([
+            TimestepEmbedSequential(nn.Conv2d(in_channels, model_channels, kernel_size=3, padding=1))
+        ])
+        down_block_channels = [model_channels]
+        ch = model_channels
+        ds = 1
+        for level, mult in enumerate(channel_mult):
+            for _ in range(num_res_blocks):
+                layers = [ResidualBlock(ch, model_channels * mult, time_emb_dim, class_emb_dim, dropout)]
+                ch = model_channels * mult
+                if ds in attention_resolutions:
+                    layers.append(AttentionBlock(ch, num_heads))
+                self.down_blocks.append(TimestepEmbedSequential(*layers))
+                down_block_channels.append(ch)
+            if level != len(channel_mult) - 1:  # Skip downsampling at the last stage
+                self.down_blocks.append(TimestepEmbedSequential(Downsample(ch, conv_resample)))
+                down_block_channels.append(ch)
+                ds *= 2
 
-        x4 = self.bot1(x4)
-        x4 = self.bot2(x4)
-        x4 = self.bot3(x4)
-
-        x = self.up1(x4, x3, t)
-        x = self.sa4(x)
-        x = self.up2(x, x2, t)
-        x = self.sa5(x)
-        x = self.up3(x, x1, t)
-        x = self.sa6(x)
-        output = self.outc(x)
-        return output
-
-
-class UNet_conditional(nn.Module):
-    def __init__(self, c_in=3, c_out=3, time_dim=256, num_classes=None, device="cuda"):
-        super().__init__()
-        self.device = device
-        self.time_dim = time_dim
-        self.inc = DoubleConv(c_in, 64)
-        self.down1 = Down(64, 128)
-        self.sa1 = SelfAttention(128, 32)
-        self.down2 = Down(128, 256)
-        self.sa2 = SelfAttention(256, 16)
-        self.down3 = Down(256, 256)
-        self.sa3 = SelfAttention(256, 8)
-
-        self.bot1 = DoubleConv(256, 512)
-        self.bot2 = DoubleConv(512, 512)
-        self.bot3 = DoubleConv(512, 256)
-
-        self.up1 = Up(512, 128)
-        self.sa4 = SelfAttention(128, 16)
-        self.up2 = Up(256, 64)
-        self.sa5 = SelfAttention(64, 32)
-        self.up3 = Up(128, 64)
-        self.sa6 = SelfAttention(64, 64)
-        self.outc = nn.Conv2d(64, c_out, kernel_size=1)
-
-        if num_classes is not None:
-            self.label_emb = nn.Embedding(num_classes, time_dim)
-
-    def pos_encoding(self, t, channels):
-        inv_freq = 1.0 / (
-            10000
-            ** (torch.arange(0, channels, 2, device=self.device).float() / channels)
+        # Middle blocks
+        self.middle_blocks = TimestepEmbedSequential(
+            ResidualBlock(ch, ch, time_emb_dim, class_emb_dim, dropout),
+            AttentionBlock(ch, num_heads),
+            ResidualBlock(ch, ch, time_emb_dim, class_emb_dim, dropout)
         )
-        pos_enc_a = torch.sin(t.repeat(1, channels // 2) * inv_freq)
-        pos_enc_b = torch.cos(t.repeat(1, channels // 2) * inv_freq)
-        pos_enc = torch.cat([pos_enc_a, pos_enc_b], dim=-1)
-        return pos_enc
 
-    def forward(self, x, t, y):
-        t = t.unsqueeze(-1).type(torch.float)
-        t = self.pos_encoding(t, self.time_dim)
+        # Upsampling blocks
+        self.up_blocks = nn.ModuleList([])
+        for level, mult in enumerate(channel_mult[::-1]):
+            for i in range(num_res_blocks + 1):
+                layers = [
+                    ResidualBlock(ch + down_block_channels.pop(), model_channels * mult,
+                                  time_emb_dim, class_emb_dim, dropout)
+                ]
+                ch = model_channels * mult
+                if ds in attention_resolutions:
+                    layers.append(AttentionBlock(ch, num_heads))
+                if level != len(channel_mult) - 1 and i == num_res_blocks:
+                    layers.append(Upsample(ch, conv_resample))
+                    ds //= 2
+                self.up_blocks.append(TimestepEmbedSequential(*layers))
 
-        if y is not None:
-            t += self.label_emb(y)
+        # Final output layer
+        self.out = nn.Sequential(
+            norm_layer(ch),
+            nn.SiLU(),
+            nn.Conv2d(ch, out_channels, kernel_size=3, padding=1)
+        )
 
-        x1 = self.inc(x)
-        x2 = self.down1(x1, t)
-        x2 = self.sa1(x2)
-        x3 = self.down2(x2, t)
-        x3 = self.sa2(x3)
-        x4 = self.down3(x3, t)
-        x4 = self.sa3(x4)
+    def forward(self, x, timesteps, c, mask):
+        """
+        Forward pass through the U-Net model.
 
-        x4 = self.bot1(x4)
-        x4 = self.bot2(x4)
-        x4 = self.bot3(x4)
+        :param x: Input tensor with shape [N, C, H, W].
+        :param timesteps: 1-D tensor of timesteps.
+        :param c: 1-D tensor of class labels.
+        :param mask: 1-D tensor indicating conditioned/unconditioned samples.
+        :return: Output tensor with shape [N, out_channels, H, W].
+        """
+        hs = []
 
-        x = self.up1(x4, x3, t)
-        x = self.sa4(x)
-        x = self.up2(x, x2, t)
-        x = self.sa5(x)
-        x = self.up3(x, x1, t)
-        x = self.sa6(x)
-        output = self.outc(x)
-        return output
+        # Embeddings for timestep and class
+        t_emb = self.time_emb(timestep_embedding(timesteps, dim=self.model_channels))
+        c_emb = self.class_emb(c)
+
+        # Downsampling stage
+        h = x
+        for module in self.down_blocks:
+            h = module(h, t_emb, c_emb, mask)
+            hs.append(h)  # Store intermediate results for skip connections
+
+        # Middle stage
+        h = self.middle_blocks(h, t_emb, c_emb, mask)
+
+        # Upsampling stage
+        for module in self.up_blocks:
+            cat_in = torch.cat([h, hs.pop()], dim=1)  # Concatenate with skip connection
+            h = module(cat_in, t_emb, c_emb, mask)
+
+        return self.out(h)
 
 
 if __name__ == '__main__':
-    # net = UNet(device="cpu")
-    net = UNet_conditional(num_classes=10, device="cpu")
-    print(sum([p.numel() for p in net.parameters()]))
-    x = torch.randn(3, 3, 64, 64)
-    t = x.new_tensor([500] * x.shape[0]).long()
-    y = x.new_tensor([1] * x.shape[0]).long()
-    print(net(x, t, y).shape)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(device)
+    test_N = 64
+    test_C = 3
+    test_H = 64
+    test_W = 64
+
+    model = UnetModel().to(device)
+
+    x = torch.randn(test_N, test_C, test_H, test_W).to(device)
+    timesteps = torch.randint(0, 1000, (test_N,)).to(device)
+    classes = torch.randint(0, 10, (test_N,)).to(device)
+    mask = torch.randn(test_N).to(device)
+
+    print(f"Input tensor shape: {x.shape}")
+    print(f"Timesteps tensor shape: {timesteps.shape}")
+    print(f"Classes tensor shape: {classes.shape}")
+    print(f"Mask tensor shape: {mask.shape}")
+
+    summary(model, input_data=[x, timesteps, classes, mask], depth=3)
+
+    # # net = UNet(device="cpu")
+    # net = UNet_conditional(num_classes=10, device="cpu")
+    # print(sum([p.numel() for p in net.parameters()]))
+    # x = torch.randn(3, 3, 64, 64)
+    # t = x.new_tensor([500] * x.shape[0]).long()
+    # y = x.new_tensor([1] * x.shape[0]).long()
+    # print(net(x, t, y).shape)
