@@ -6,62 +6,102 @@ import torch.nn as nn
 from tqdm import tqdm
 from torch import optim
 from .utils import *
-from .modules import UNet_conditional, EMA
+from .modules import UnetModel, EMA
+import torchvision.utils as vutils
 import logging
 from torch.utils.tensorboard import SummaryWriter
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s: %(message)s", level=logging.INFO, datefmt="%I:%M:%S")
 
+def create_model_directory(run_name):
+    """Create the model directory if it doesn't exist."""
+    model_dir = os.path.join("models", run_name)
+    os.makedirs(model_dir, exist_ok=True)
+    return model_dir
 
-class Diffusion:
-    def __init__(self, noise_steps=1000, beta_start=1e-4, beta_end=0.02, img_size=256, device="cuda"):
-        self.noise_steps = noise_steps
-        self.beta_start = beta_start
-        self.beta_end = beta_end
+def load_checkpoint(model, optimizer, ema_model, model_dir):
+    """Load model and optimizer states from checkpoint."""
+    checkpoint_path = os.path.join(model_dir, "ckpt.pt")
+    optimizer_path = os.path.join(model_dir, "optim.pt")
+    ema_path = os.path.join(model_dir, "ema_ckpt.pt")
 
-        self.beta = self.prepare_noise_schedule().to(device)
-        self.alpha = 1. - self.beta
-        self.alpha_hat = torch.cumprod(self.alpha, dim=0)
+    if os.path.exists(checkpoint_path) and os.path.exists(optimizer_path):
+        model.load_state_dict(torch.load(checkpoint_path))
+        optimizer.load_state_dict(torch.load(optimizer_path))
+        if os.path.exists(ema_path):
+            ema_model.load_state_dict(torch.load(ema_path))
+        print("Loaded model and optimizer from checkpoint.")
+        return True  # Indicate that a checkpoint was loaded
+    else:
+        print("No checkpoint found, starting fresh.")
+        return False  # No checkpoint loaded
 
-        self.img_size = img_size
-        self.device = device
 
-    def prepare_noise_schedule(self):
-        return torch.linspace(self.beta_start, self.beta_end, self.noise_steps)
+def train_one_epoch(model, dataloader, optimizer, diffusion, device, epoch, args, ema, loss_fn, save_images_fn):
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=True)
 
-    def noise_images(self, x, t):
-        sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
-        sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
-        Ɛ = torch.randn_like(x)
-        return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * Ɛ, Ɛ
+    # Track the total loss for averaging
+    total_loss = 0
+    num_batches = len(dataloader)
 
-    def sample_timesteps(self, n):
-        return torch.randint(low=1, high=self.noise_steps, size=(n,))
+    for i, (images, labels) in enumerate(pbar):
+        images = images.to(device)
+        labels = labels.to(device)
 
-    def sample(self, model, n, labels, cfg_scale=3):
-        logging.info(f"Sampling {n} new images....")
-        model.eval()
-        with torch.no_grad():
-            x = torch.randn((n, 3, self.img_size, self.img_size)).to(self.device)
-            for i in tqdm(reversed(range(1, self.noise_steps)), position=0):
-                t = (torch.ones(n) * i).long().to(self.device)
-                predicted_noise = model(x, t, labels)
-                if cfg_scale > 0:
-                    uncond_predicted_noise = model(x, t, None)
-                    predicted_noise = torch.lerp(uncond_predicted_noise, predicted_noise, cfg_scale)
-                alpha = self.alpha[t][:, None, None, None]
-                alpha_hat = self.alpha_hat[t][:, None, None, None]
-                beta = self.beta[t][:, None, None, None]
-                if i > 1:
-                    noise = torch.randn_like(x)
-                else:
-                    noise = torch.zeros_like(x)
-                x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
-        model.train()
-        x = (x.clamp(-1, 1) + 1) / 2
-        x = (x * 255).type(torch.uint8)
-        return x
+        t = diffusion.sample_timesteps(images.shape[0]).to(device)
+        x_t, noise = diffusion.noise_images(images, t)
 
+        # Randomly generate mask
+        z_uncound = torch.rand(images.shape[0])
+        batch_mask = (z_uncound > 0.10).int().to(device)
+
+        predicted_noise = model(x_t, t, labels, batch_mask)
+        loss = loss_fn(noise, predicted_noise)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # Update EMA
+        ema.step_ema(model)
+
+        # Accumulate loss for averaging
+        total_loss += loss.item()
+
+        # Update the progress bar with the current loss
+        pbar.set_postfix(MSE=loss.item())
+
+    # Calculate and print average loss after each epoch
+    avg_loss = total_loss / num_batches
+    print(f"Average loss after epoch {epoch}: {avg_loss:.4f}")
+
+    # Save generated images and model checkpoints based on args.save_epochs
+    if (epoch + 1) % args.save_epochs == 0:
+        epoch_str = str(epoch + 1).zfill(4)  # Zero-pad epoch number
+        torch.save(model.state_dict(), os.path.join(model_dir, f"model_epoch_{epoch_str}.pt"))
+        torch.save(optimizer.state_dict(), os.path.join(model_dir, f"optim_epoch_{epoch_str}.pt"))
+        torch.save(ema.state_dict(), os.path.join(model_dir, f"ema_model_epoch_{epoch_str}.pt"))
+
+        # Generate and save images
+        labels = torch.arange(10).long().to(device)
+        sampled_images = diffusion.sample(model, n=len(labels), labels=labels)
+        save_images_fn(sampled_images, os.path.join(model_dir, f"sampled_images_epoch_{epoch_str}.jpg"))
+
+
+def save_model_and_results(model, optimizer, ema_model, model_dir, epoch, diffusion, device):
+    """Save model, optimizer states, EMA model, and sample images."""
+    torch.save(model.state_dict(), os.path.join(model_dir, "ckpt.pt"))
+    torch.save(optimizer.state_dict(), os.path.join(model_dir, "optim.pt"))
+    torch.save(ema_model.state_dict(), os.path.join(model_dir, "ema_ckpt.pt"))  # Save EMA model as well
+
+    # Sample images using the diffusion model
+    labels = torch.arange(10).long().to(device)  # Assuming you want to sample 10 images
+    sampled_images = diffusion.sample(model, n=len(labels), labels=labels)
+
+    # Save the sampled images
+    save_image_path = os.path.join(model_dir, f"sampled_images_epoch_{epoch + 1}.png")
+    vutils.save_image(sampled_images, save_image_path, nrow=5, normalize=True)
+    print(f"Saved sampled images at {save_image_path}")
 
 def train(args):
     setup_logging(args.run_name)
@@ -109,23 +149,23 @@ def train(args):
             torch.save(optimizer.state_dict(), os.path.join("models", args.run_name, f"optim.pt"))
 
 
-def launch():
-    import argparse
-    parser = argparse.ArgumentParser()
-    args = parser.parse_args()
-    args.run_name = "DDPM_conditional"
-    args.epochs = 300
-    args.batch_size = 14
-    args.image_size = 64
-    args.num_classes = 10
-    args.dataset_path = r"C:\Users\dome\datasets\cifar10\cifar10-64\train"
-    args.device = "cuda"
-    args.lr = 3e-4
-    train(args)
+# def launch():
+#     import argparse
+#     parser = argparse.ArgumentParser()
+#     args = parser.parse_args()
+#     args.run_name = "DDPM_conditional"
+#     args.epochs = 300
+#     args.batch_size = 14
+#     args.image_size = 64
+#     args.num_classes = 10
+#     args.dataset_path = r"C:\Users\dome\datasets\cifar10\cifar10-64\train"
+#     args.device = "cuda"
+#     args.lr = 3e-4
+#     train(args)
 
 
-if __name__ == '__main__':
-    launch()
+# if __name__ == '__main__':
+#     launch()
     # device = "cuda"
     # model = UNet_conditional(num_classes=10).to(device)
     # ckpt = torch.load("./models/DDPM_conditional/ckpt.pt")
