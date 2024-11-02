@@ -218,6 +218,7 @@ class UnetModel(nn.Module):
                  channel_mult=(1, 2, 2, 2),
                  conv_resample=True,
                  num_heads=4,
+                 conditional=False,
                  class_num=10):
         """
         Initialize a U-Net model for conditional image generation with attention mechanisms.
@@ -243,6 +244,7 @@ class UnetModel(nn.Module):
         self.channel_mult = channel_mult
         self.conv_resample = conv_resample
         self.num_heads = num_heads
+        self.conditional = conditional
         self.class_num = class_num
 
         # Time embedding
@@ -322,6 +324,9 @@ class UnetModel(nn.Module):
         # Embeddings for timestep and class
         t_emb = self.time_emb(timestep_embedding(timesteps, dim=self.model_channels))
         c_emb = self.class_emb(c)
+
+        if self.conditional == False:
+            mask =  torch.zeros_like(mask)
 
         # Downsampling stage
         h = x
